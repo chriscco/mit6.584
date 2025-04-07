@@ -11,6 +11,7 @@ import (
 	"log"
 	"math/rand"
 	"sync"
+	"math"
 	"sync/atomic"
 	"time"
 
@@ -58,7 +59,7 @@ type Raft struct {
 	// 快照，用于日志压缩
 	snapshot []byte // 快照的二进制数据
 	lastIncludedTerm int // 快照最后一条日志的任期 
-	lastIncludedIndex int // 快照最后一条日志的索引
+	lastIncludedIndex int // 快照最后一条日志的索引，之后的日志都保存在 log 中
 }
 
 const (
@@ -76,11 +77,11 @@ const (
 
 // return currentTerm and whether this server
 // believes it is the leader.
-func (rf *Raft) GetState() (int, bool) {
-
-	var term int
-	var isleader bool
-	// Your code here (3A).
+func (raft *Raft) GetState() (int, bool) {
+	raft.lock.Lock()
+	var term int = raft.currentTerm
+	var isleader bool = raft.state == Leader 
+	raft.lock.Unlock()
 	return term, isleader
 }
 
@@ -157,41 +158,14 @@ type RequestVoteReply struct {
 	VoteGranted bool 
 }
 
-// example RequestVote RPC handler.
-func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
-	// Your code here (3A, 3B).
-}
-
-// example code to send a RequestVote RPC to a server.
-// server is the index of the target server in rf.peers[].
-// expects RPC arguments in args.
-// fills in *reply with RPC reply, so caller should
-// pass &reply.
-// the types of the args and reply passed to Call() must be
-// the same as the types of the arguments declared in the
-// handler function (including whether they are pointers).
-//
-// The labrpc package simulates a lossy network, in which servers
-// may be unreachable, and in which requests and replies may be lost.
-// Call() sends a request and waits for a reply. If a reply arrives
-// within a timeout interval, Call() returns true; otherwise
-// Call() returns false. Thus Call() may not return for a while.
-// A false return can be caused by a dead server, a live server that
-// can't be reached, a lost request, or a lost reply.
-//
-// Call() is guaranteed to return (perhaps after a delay) *except* if the
-// handler function on the server side does not return.  Thus there
-// is no need to implement your own timeouts around Call().
-//
-// look at the comments in ../labrpc/labrpc.go for more details.
-//
-// if you're having trouble getting RPC to work, check that you've
-// capitalized all field names in structs passed over RPC, and
-// that the caller passes the address of the reply struct with &, not
-// the struct itself.
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
 	return ok
+}
+
+func (raft *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	ok := raft.peers[server].Call("Raft.cycleAppendEntry", args, reply) 
+	return ok 
 }
 
 
@@ -237,8 +211,14 @@ func (rf *Raft) killed() bool {
 	return z == 1
 }
 
+// 本地 logs 下标转换为全局索引
 func (raft *Raft) ToVirtualIndex(index int) int {
 	return index + raft.lastIncludedIndex
+}
+
+// 全局索引转换为本地 logs 下标
+func (raft *Raft) ToRealIndex(index int) int {
+	return index - raft.lastIncludedIndex
 }
 
 // ticker() 的作用
@@ -388,9 +368,198 @@ func (raft *Raft) HandlerRequestVote(args *RequestVoteArgs, reply *RequestVoteRe
 	raft.lock.Unlock()
 }
 
-// 周期心跳函数
-func (raft *Raft) cycleAppendEntry() {
+type AppendEntriesArgs struct {
+	LeaderID int 
+	Term int 
+	LeaderCommit int // 告诉 Follower 当前集群已经更新到哪一条日志了
+	PrevLogIndex int // Follower 上一次日志的最后一条索引
+	PrevLogTerm int // Follower 上一次日志的更新任期 
+	Entries []LogEntry
+}
 
+type AppendEntriesReply struct {
+	Term int 
+	Success bool // 日志是否匹配 
+	XTerm   int  
+    XIndex  int  
+    XLen    int  
+}
+
+// 周期心跳函数
+// Leader 在后台定时给 Follower 发送心跳或日子同步
+func (raft *Raft) cycleAppendEntry() {
+	// 记录当前时间，后续每隔 100ms 发送一次心跳
+	raft.nextHeartBeat = time.Now()
+
+	for !raft.killed() {
+		raft.lock.Lock()
+		// 只有 Leader 可以发送心跳
+		if raft.state != Leader {
+			raft.lock.Unlock()
+			return 
+		}
+		// 如果还没到发送心跳的时间，跳过这次循环
+		if !time.Now().After(raft.nextHeartBeat) {
+			raft.lock.Unlock()
+			return 
+		}
+
+		for i := 0; i < len(raft.peers); i++ {
+			if i == raft.me {
+				continue 
+			}
+			reply := AppendEntriesReply{} 
+			args := AppendEntriesArgs {
+				LeaderID: raft.me,
+				Term: raft.currentTerm,
+				LeaderCommit: raft.commitIndex,
+				PrevLogIndex: raft.nextIndex[i] - 1,
+			}
+			flag := false 
+			// 判断是要同步日志还是发送快照
+			if args.PrevLogIndex < raft.lastIncludedIndex {
+				flag = true 
+			} else if raft.ToVirtualIndex(len(raft.log) - 1) > args.PrevLogIndex {
+				args.Entries = raft.log[raft.ToRealIndex(args.PrevLogIndex + 1): ]
+			} else {
+				// 如果日志已经全部同步，发送一个空的心跳
+				args.Entries = make([]LogEntry, 0)
+			}
+
+			if flag {
+				// 如果 Follower 的上一次日志太旧，比如更新到日志索引 100，
+				// 但是 Leader 已经更新到 500，并且 100 之后的日志都已经做成快照扔掉了
+				// 此时 Leader 不能通过 RPC 将日志 Append 给 Follower 
+				// Leader 需要将快照中的日志发给 Follower 
+				go raft.SendInstallSnapshot(i)
+			} else {
+				// 正常发送心跳 
+				args.PrevLogTerm = raft.log[raft.ToRealIndex(len(raft.log))].Term
+				go raft.SendAppendEntries(i, &args, &reply)
+			}
+		}
+		raft.nextHeartBeat = time.Now().Add(time.Duration(HeartBeatInterval) * time.Millisecond)
+		raft.lock.Unlock()
+	}
+}
+
+
+func (raft *Raft) SendInstallSnapshot(index int) {
+
+}
+
+func (raft *Raft) SendAppendEntries(server int, args *AppendEntriesArgs, 
+								reply *AppendEntriesReply) {
+	ok := raft.sendAppendEntries(server, args, reply)
+	if !ok {
+		return 
+	}
+	raft.lock.Lock()
+	// 如果任期变化，比如当前节点已经不是 Leader 了
+	if raft.currentTerm != args.Term {
+		log.Printf("failed due to old rpc, server: %v\n", server)
+		raft.lock.Unlock() 
+		return 
+	}
+
+	if reply.Term > raft.currentTerm {
+		raft.currentTerm = reply.Term
+		raft.state = Follower 
+		raft.votedFor = None 
+		raft.voteNum = 0
+
+		raft.persist()
+		raft.lock.Unlock() 
+		return 
+	}
+}
+
+// Follower 处理 Leader 发送的 RPC 逻辑
+// 同时处理日志同步和心跳检测的任务 
+func (raft *Raft) HandlerAppendEntries(server int, args *AppendEntriesArgs, 
+			reply *AppendEntriesReply) {
+	raft.lock.Lock() 
+	
+	// 判断 Leader 的任期是否小于自己的，需要忽略这个旧的请求，防止旧 Leader 干扰集群
+	if args.Term < raft.currentTerm {
+		log.Printf("failed, leader is old, server: %v\n", server)
+		reply.Success = false 
+		reply.Term = raft.currentTerm 
+		raft.lock.Unlock()
+		return 
+	}
+	raft.stamp = time.Now() 
+	// 遇到更大的任期，更新自己为 Follower 
+	if args.Term > raft.currentTerm {
+		raft.currentTerm = args.Term 
+		raft.votedFor = None 
+		raft.voteNum = 0 
+		raft.state = Follower 
+		raft.persist() 
+	}
+
+	isConflict := false 
+	// 如果需要匹配的日志索引 args.PrevLogIndex （即 Follower 的日志太小）或是
+	// 日志索引太小（即已经被快照覆盖了）都会造成日志冲突
+	if args.PrevLogIndex >= raft.ToVirtualIndex(len(raft.log)) || 
+			args.PrevLogIndex < raft.lastIncludedIndex {
+		reply.XTerm = -1 
+		reply.XLen = raft.ToVirtualIndex(len(raft.log))
+		isConflict = true
+	} else if args.PrevLogTerm != raft.log[raft.ToRealIndex(args.PrevLogIndex)].Term {
+		// 或是需要匹配的日志任期对不上，也会造成日志冲突 
+		reply.XTerm = raft.log[raft.ToRealIndex(args.PrevLogIndex)].Term 
+		// 向前回溯，Leader 可以找到这个 XTerm 第一次出现的位置
+		// 可以一次性跳过整个冲突的任期，而不需要一条条回退 
+		i := args.PrevLogIndex 
+		for i > raft.lastIncludedIndex && raft.log[raft.ToRealIndex(i)].Term == reply.XTerm {
+			i -= 1
+		}
+		reply.XIndex = i + 1 
+		reply.XLen = raft.ToRealIndex(len(raft.log))
+		isConflict = true 
+		log.Printf("log term unmatched for server: %v in term: %v\n", server, reply.XTerm)
+	}
+
+	if isConflict {
+		reply.Success = false 
+		reply.Term = raft.currentTerm  
+		raft.lock.Unlock() 
+		return 
+	}
+
+	// 经过上述的检查，这里可以开始进行日志同步了 
+	if len(args.Entries) != 0 {
+		lastLogIndex := raft.ToVirtualIndex(len(raft.log))
+		lastLogTerm := raft.log[raft.ToRealIndex(lastLogIndex)].Term
+
+		// 如果本地日志任期和 Leader 的不匹配
+		// 或是 Leader 的日志比自己的新
+		// 删除冲突部分后面的日志，加上 Leader 的新日志 
+		if lastLogTerm != args.Term || 
+			args.PrevLogIndex + len(args.Entries) >= lastLogIndex {
+			raft.log = raft.log[: args.PrevLogIndex + 1]
+			raft.log = append(raft.log, args.Entries...)
+		}
+	}
+	raft.persist() 
+
+	// Leader 告知自己现在推进到哪一个日志
+	// Follower 自行将自己的 commitIndex 更新到 Leader 的最新日志索引
+	// 和自己的最新日志索引的最小值
+	// 保证 Follower 不提交自己没有的日志 
+	if args.LeaderCommit > raft.commitIndex {
+		raft.commitIndex = int(math.Min(float64(args.LeaderCommit), float64(raft.commitIndex)))
+	}
+
+	if raft.state == Follower {
+		reply.Success = true 
+		reply.Term = raft.currentTerm 
+		raft.lock.Unlock() 
+		return 
+	}
+
+	raft.lock.Unlock() 
 }
 
 // 创建一个 Raft 对象（new Raft）
