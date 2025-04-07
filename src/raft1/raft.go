@@ -8,6 +8,7 @@ package raft
 
 import (
 	//	"bytes"
+	"log"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -26,7 +27,7 @@ type LogEntry struct {
 
 // A Go object implementing a single Raft peer.
 type Raft struct {
-	mu        sync.Mutex          // 保护并发访问 Raft 共享状态
+	lock        sync.Mutex          // 保护并发访问 Raft 共享状态
 	peers     []*labrpc.ClientEnd // 所有 Raft 节点的 RPC 客户端
 	persister *tester.Persister   // 用作持久化自己的状态，比如崩溃恢复时从磁盘读回
 	me        int                 // 本节点的 id（在 peers[] 中的位置）
@@ -127,8 +128,8 @@ func (rf *Raft) readPersist(data []byte) {
 
 // how many bytes in Raft's persisted log?
 func (rf *Raft) PersistBytes() int {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
+	rf.lock.Lock()
+	defer rf.lock.Unlock()
 	return rf.persister.RaftStateSize()
 }
 
@@ -143,16 +144,17 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 }
 
 
-// example RequestVote RPC arguments structure.
-// field names must start with capital letters!
+// 定义请求参数与回复参数
 type RequestVoteArgs struct {
-	// Your data here (3A, 3B).
+	Term int 
+	CandidateID int 
+	PrevLogIndex int 
+	PrevLogTerm int 
 }
 
-// example RequestVote RPC reply structure.
-// field names must start with capital letters!
 type RequestVoteReply struct {
-	// Your data here (3A).
+	Term int 
+	VoteGranted bool 
 }
 
 // example RequestVote RPC handler.
@@ -235,18 +237,160 @@ func (rf *Raft) killed() bool {
 	return z == 1
 }
 
-func (rf *Raft) ticker() {
-	for rf.killed() == false {
+func (raft *Raft) ToVirtualIndex(index int) int {
+	return index + raft.lastIncludedIndex
+}
 
-		// Your code here (3A)
-		// Check if a leader election should be started.
-
-
-		// pause for a random amount of time between 50 and 350
-		// milliseconds.
-		ms := 50 + (rand.Int63() % 300)
-		time.Sleep(time.Duration(ms) * time.Millisecond)
+// ticker() 的作用
+// 作为 Follower：超时没收到心跳，要开始竞选（成为 Candidate）
+// 作为 Leader：定期给所有 Follower 发送心跳
+func (raft *Raft) ticker() {
+	random_timeout := rand.Intn(MaxElectionTime) + MinElectionTime
+	log.Printf("election timeout %v for raft: %v\n", random_timeout, raft.me)
+	for !raft.killed() {
+		raft.lock.Lock()
+		// 如果当前的时间点已经超过了上次收到心跳/请求的时间点 + 超时值
+		if raft.state != Leader && 
+			time.Now().After(raft.stamp.Add(time.Duration(random_timeout) * time.Millisecond)) {
+			
+			log.Printf("timeout: stamp: %v, raft: %v\n", raft.stamp, raft.me)
+			go raft.election()
+		}
+		random_timeout = rand.Intn(MaxElectionTime) + MinElectionTime
+		time.Sleep(time.Duration(random_timeout) * time.Millisecond)
 	}
+}
+
+// 发起一轮选举，自己成为 Candidate
+func (raft *Raft) election() {
+	raft.lock.Lock() 
+	log.Printf("start election, raft: %v\n", raft.me)
+
+	raft.state = Candidate
+	raft.votedFor = raft.me 
+	raft.voteNum = 1
+	raft.currentTerm += 1
+	// 投票给自己同样算作一次 RPC 通信
+	raft.stamp = time.Now()
+	raft.persist() 
+
+	args := RequestVoteArgs {
+		Term: raft.currentTerm,
+		CandidateID: raft.me,
+		PrevLogTerm: raft.currentTerm,
+		PrevLogIndex: raft.ToVirtualIndex(len(raft.log) - 1),
+	}
+	raft.lock.Unlock()
+
+	for i, _ := range raft.peers {
+		if i == raft.me {
+			continue
+		} 
+		reply := RequestVoteReply{}
+		go raft.collectVote(raft.me, &args, &reply)
+	}
+}
+
+// 收集投票结果
+func (raft *Raft) collectVote(server int, args *RequestVoteArgs, 
+		reply *RequestVoteReply) {
+	ok := raft.sendRequestVote(server, args, reply)
+	if !ok {
+		return 
+	}
+	raft.lock.Lock()
+	// 来自过时的任期，应该直接忽略
+	if args.Term != raft.currentTerm {
+		raft.lock.Unlock()
+		return 
+	}
+
+	// 自己的任期已经过时，不能再成为 Candidate
+	if reply.Term > raft.currentTerm {
+		raft.currentTerm = reply.Term
+		raft.state = Follower
+		raft.votedFor = None 
+		raft.voteNum = 0
+		raft.persist() 
+		raft.lock.Unlock()
+		return 
+	}
+
+	// 如果对方拒绝投票或者自己已经不是候选人，可以忽略
+	if !reply.VoteGranted || raft.state != Candidate {
+		raft.lock.Unlock()
+		return 
+	}
+
+	raft.voteNum += 1
+	if raft.voteNum > len(raft.peers) / 2 && raft.state == Candidate {
+		raft.state = Leader 
+		log.Printf("server %v becomes leader in term %v\n", server, raft.currentTerm)
+
+		for i := 0; i < len(raft.nextIndex); i++ {
+			raft.nextIndex[i] = raft.ToVirtualIndex(len(raft.log))
+		}
+		go raft.cycleAppendEntry() 
+	}
+	raft.lock.Unlock()
+}
+
+// 处理求票 RPC，一个节点需要决定是否要投票
+// 1. 对于收到的 Term 比自己大时，需要通过 votedFor 判断自己的票是否还在
+// 2。 对于一个 Candidate 需要成为 Leader，那么自己必须要持有最新的日志，并且还没有投过票
+func (raft *Raft) HandlerRequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
+	raft.lock.Lock()
+	log.Printf("server %v received request from %v\n", raft.me, args.CandidateID)
+ 
+	// 判断是否是过时的候选人
+	if args.Term < raft.currentTerm {
+		log.Printf("server %v failed, requested term is old\n", args.CandidateID)
+		reply.VoteGranted = false 
+		reply.Term = raft.currentTerm 
+		raft.lock.Unlock()
+		return 
+	}
+	// 对方的任期大于自己的，将自己变更为 Follower 
+	if args.Term > raft.currentTerm {
+		log.Printf("server %v in higher term %v\n", args.CandidateID, args.Term)
+		raft.currentTerm = args.Term 
+		raft.votedFor = None 
+		raft.voteNum = 0 
+		raft.state = Follower 
+		raft.persist() 
+	}
+
+	if raft.votedFor == None || raft.votedFor == args.CandidateID {
+		// 检查日志是否足够新 
+		// 如果 Candidate 的日志比自己新或一样新，可以给它投票
+		if (args.PrevLogTerm == raft.log[len(raft.log) - 1].Term && 
+			args.PrevLogIndex >= raft.ToVirtualIndex(len(raft.log) - 1)) || 
+			args.PrevLogTerm > raft.log[len(raft.log) - 1].Term {
+			
+			raft.currentTerm = args.Term 
+			raft.state = Follower 
+			raft.voteNum = 0
+			raft.votedFor = args.CandidateID 
+			raft.stamp = time.Now()
+			raft.persist()
+
+			reply.VoteGranted = true 
+			reply.Term = args.Term 
+
+			raft.lock.Unlock()
+			return 
+		}
+	}
+
+	log.Printf("server %v refused to vote for %v\n", raft.me, args.CandidateID)
+	reply.VoteGranted = false 
+	reply.Term = raft.currentTerm 
+	raft.lock.Unlock()
+}
+
+// 周期心跳函数
+func (raft *Raft) cycleAppendEntry() {
+
 }
 
 // 创建一个 Raft 对象（new Raft）
@@ -278,6 +422,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.ReadSnapshot(persister.ReadSnapshot())	
 	rf.readPersist(persister.ReadRaftState())
 	rf.nextIndex = make([]int, length)
+	log.Printf("raft recovered from persistor\n")
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
