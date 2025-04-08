@@ -182,15 +182,20 @@ func (raft *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *
 // if it's ever committed. the second return value is the current
 // term. the third return value is true if this server believes it is
 // the leader.
-func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
-
-	// Your code here (3B).
-
-
-	return index, term, isLeader
+func (raft *Raft) Start(command interface{}) (int, int, bool) {
+	raft.lock.Lock() 
+	defer raft.lock.Unlock()
+	if raft.state != Leader {
+		return -1, -1, false
+	}
+	raft.log = append(raft.log, LogEntry{
+		Command: command,
+		Term: raft.currentTerm,
+	})
+	raft.persist() 
+	raft.nextHeartBeat = time.Now() 
+	log.Printf("new command: %v\n", command)
+	return raft.ToVirtualIndex(len(raft.log) - 1), raft.currentTerm, true
 }
 
 // the tester doesn't halt goroutines created by Raft after each test,
@@ -287,18 +292,20 @@ func (raft *Raft) collectVote(server int, args *RequestVoteArgs,
 		reply *RequestVoteReply) {
 	ok := raft.sendRequestVote(server, args, reply)
 	if !ok {
-		log.Fatalf("failed RPC, server: %v\n", server)
+		log.Printf("failed RPC, server: %v\n", server)
 		return 
 	}
 	raft.lock.Lock()
 	// 来自过时的任期，应该直接忽略
 	if args.Term != raft.currentTerm {
+		log.Printf("outdated term: %v, should be in term: %v\n", args.Term, raft.currentTerm)
 		raft.lock.Unlock()
 		return 
 	}
 
 	// 自己的任期已经过时，不能再成为 Candidate
 	if reply.Term > raft.currentTerm {
+		log.Printf("my term is outdated: %v, cannot be candidate: %v\n", raft.currentTerm, reply.Term)
 		raft.currentTerm = reply.Term
 		raft.state = Follower
 		raft.votedFor = None 
@@ -311,13 +318,14 @@ func (raft *Raft) collectVote(server int, args *RequestVoteArgs,
 	// 如果对方拒绝投票或者自己已经不是候选人，可以忽略
 	if !reply.VoteGranted || raft.state != Candidate {
 		raft.lock.Unlock()
+		log.Printf("not candidate ?: %v, voteGranted ?: %v\n", raft.state, reply.VoteGranted)
 		return 
 	}
 
 	raft.voteNum += 1
 	if raft.voteNum > len(raft.peers) / 2 && raft.state == Candidate {
 		raft.state = Leader 
-		log.Printf("server %v becomes leader in term %v\n", server, raft.currentTerm)
+		log.Printf("server %v becomes leader in term %v with log: %v\n", server, raft.currentTerm, raft.log)
 
 		for i := 0; i < len(raft.nextIndex); i++ {
 			raft.nextIndex[i] = raft.ToVirtualIndex(len(raft.log))
@@ -367,7 +375,7 @@ func (raft *Raft) HandlerRequestVote(args *RequestVoteArgs, reply *RequestVoteRe
 			raft.persist()
 
 			reply.VoteGranted = true 
-			reply.Term = args.Term 
+			reply.Term = raft.currentTerm
 
 			raft.lock.Unlock()
 			return 
@@ -398,7 +406,7 @@ type AppendEntriesReply struct {
 }
 
 // 周期心跳函数
-// Leader 在后台定时给 Follower 发送心跳或日子同步
+// Leader 在后台定时给 Follower 发送心跳或日志同步
 func (raft *Raft) AppendEntry() {
 	// 记录当前时间，后续每隔 100ms 发送一次心跳
 	raft.nextHeartBeat = time.Now()
@@ -428,13 +436,17 @@ func (raft *Raft) AppendEntry() {
 				PrevLogIndex: raft.nextIndex[i] - 1,
 			}
 			flag := false 
+
+			log.Printf("how long is log: %v\n", len(raft.log))
 			// 判断是要同步日志还是发送快照
 			if args.PrevLogIndex < raft.lastIncludedIndex {
 				flag = true 
-			} else if raft.ToVirtualIndex(len(raft.log) - 1) > args.PrevLogIndex {
+			} else if raft.ToVirtualIndex(len(raft.log) - 1) > args.PrevLogIndex  {
 				args.Entries = raft.log[raft.ToRealIndex(args.PrevLogIndex + 1): ]
+				log.Printf("entries appended: %v\n", args.Entries)
 			} else {
 				// 如果日志已经全部同步，发送一个空的心跳
+				log.Printf("no log needs to update, sending heartbeat\n")
 				args.Entries = make([]LogEntry, 0)
 			}
 
@@ -443,6 +455,7 @@ func (raft *Raft) AppendEntry() {
 				// 但是 Leader 已经更新到 500，并且 100 之后的日志都已经做成快照扔掉了
 				// 此时 Leader 不能通过 RPC 将日志 Append 给 Follower 
 				// Leader 需要将快照中的日志发给 Follower 
+				log.Printf("log is too old\n")
 				go raft.SendInstallSnapshot(i)
 			} else {
 				// 正常发送心跳 
@@ -464,6 +477,7 @@ func (raft *Raft) SendAppendEntries(server int, args *AppendEntriesArgs,
 								reply *AppendEntriesReply) {
 	ok := raft.sendAppendEntries(server, args, reply)
 	if !ok {
+		log.Printf("sendAppendEntries failed in server %v\n", server)
 		return 
 	}
 	raft.lock.Lock()
@@ -486,6 +500,7 @@ func (raft *Raft) SendAppendEntries(server int, args *AppendEntriesArgs,
 	}
 
 	if reply.Success {
+		log.Printf("reply.Success in server: %v\n", server)
 		raft.matchIndex[server] = args.PrevLogIndex + len(args.Entries)
 		raft.nextIndex[server] = args.PrevLogIndex + len(args.Entries) + 1
 
@@ -495,13 +510,16 @@ func (raft *Raft) SendAppendEntries(server int, args *AppendEntriesArgs,
 		// 3. 并且这条日志的任期必须喝当前任期一致
 		// 4. 如果是，则可以安全地更新 commitIndex
 		N := raft.ToVirtualIndex(len(raft.log) - 1) 
+
 		for N > raft.commitIndex {
+			log.Printf("in N(%v) > raft.commitIndex(%v)\n", N, raft.commitIndex)
 			count := 1 
-			for i := range(len(raft.peers)) {
+			for i := 0; i < len(raft.peers); i++ {
 				if i == raft.me {
 					continue 
 				}
 				if raft.matchIndex[i] >= N && raft.log[raft.ToRealIndex(N)].Term == raft.currentTerm {
+					log.Printf("add count to server %v\n", server)
 					count += 1
 				}
 			}
@@ -533,7 +551,28 @@ func (raft *Raft) SendAppendEntries(server int, args *AppendEntriesArgs,
 			return
 		} 
 	}
-
+	// 处理日志冲突 
+	i := raft.nextIndex[server] - 1 
+	if i < raft.lastIncludedIndex {
+		i = raft.lastIncludedIndex
+	}
+	// 从 nextIndex 往前找，找到 <= reply.XTerm 的位置
+	for i > raft.lastIncludedIndex && raft.log[raft.ToRealIndex(i)].Term > reply.XTerm {
+		i--
+	}
+	// 如果当前日志中找不到对应的任期，发送快照请求 
+	if i == raft.lastIncludedIndex && raft.log[raft.ToRealIndex(i)].Term > reply.XTerm {
+		go raft.SendInstallSnapshot(server)
+	} else if raft.log[raft.ToRealIndex(i)].Term == reply.XTerm {
+		raft.nextIndex[server] = i + 1
+	} else {
+		if reply.XIndex <= raft.lastIncludedIndex {
+			go raft.SendInstallSnapshot(server)
+		} else {
+			raft.nextIndex[server] = reply.XIndex
+		}
+	}
+	raft.lock.Unlock()
 }
 
 // Follower 处理 Leader 发送的 RPC 逻辑
@@ -541,6 +580,8 @@ func (raft *Raft) SendAppendEntries(server int, args *AppendEntriesArgs,
 func (raft *Raft) HandlerAppendEntries(args *AppendEntriesArgs, 
 			reply *AppendEntriesReply) {
 	raft.lock.Lock() 
+
+	log.Printf("args.entries: %v\n", args.Entries)
 	
 	// 判断 Leader 的任期是否小于自己的，需要忽略这个旧的请求，防止旧 Leader 干扰集群
 	if args.Term < raft.currentTerm {
@@ -553,6 +594,7 @@ func (raft *Raft) HandlerAppendEntries(args *AppendEntriesArgs,
 	raft.stamp = time.Now() 
 	// 遇到更大的任期，更新自己为 Follower 
 	if args.Term > raft.currentTerm {
+		log.Printf("update myself to follower\n")
 		raft.currentTerm = args.Term 
 		raft.votedFor = None 
 		raft.voteNum = 0 
@@ -592,7 +634,7 @@ func (raft *Raft) HandlerAppendEntries(args *AppendEntriesArgs,
 
 	// 经过上述的检查，这里可以开始进行日志同步了 
 	if len(args.Entries) != 0 {
-		lastLogIndex := raft.ToVirtualIndex(len(raft.log))
+		lastLogIndex := raft.ToVirtualIndex(len(raft.log) - 1)
 		lastLogTerm := raft.log[raft.ToRealIndex(lastLogIndex)].Term
 
 		// 如果本地日志任期和 Leader 的不匹配
@@ -600,11 +642,14 @@ func (raft *Raft) HandlerAppendEntries(args *AppendEntriesArgs,
 		// 删除冲突部分后面的日志，加上 Leader 的新日志 
 		if lastLogTerm != args.Term || 
 			args.PrevLogIndex + len(args.Entries) >= lastLogIndex {
-			raft.log = raft.log[: args.PrevLogIndex + 1]
+			raft.log = raft.log[: raft.ToRealIndex(args.PrevLogIndex + 1)]
 			raft.log = append(raft.log, args.Entries...)
 		}
 	}
 	raft.persist() 
+	if len(args.Entries) != 0 {
+		log.Printf("server %v append %v successfully\n", raft.me, args.Entries)
+	}
 
 	// Leader 告知自己现在推进到哪一个日志
 	// Follower 自行将自己的 commitIndex 更新到 Leader 的最新日志索引
@@ -653,7 +698,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.ReadSnapshot(persister.ReadSnapshot())	
 	rf.readPersist(persister.ReadRaftState())
 	rf.nextIndex = make([]int, length)
-	log.Printf("raft recovered from persistor\n")
+	log.Printf("raft recovered from persistor, with log size: %v\n", len(rf.log))
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
