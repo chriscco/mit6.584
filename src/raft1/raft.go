@@ -165,7 +165,7 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 }
 
 func (raft *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
-	ok := raft.peers[server].Call("Raft.cycleAppendEntry", args, reply) 
+	ok := raft.peers[server].Call("Raft.AppendEntries", args, reply) 
 	return ok 
 }
 
@@ -222,6 +222,14 @@ func (raft *Raft) ToRealIndex(index int) int {
 	return index - raft.lastIncludedIndex
 }
 
+func (raft *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
+	raft.HandlerRequestVote(args, reply)
+}
+
+func (raft *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	raft.HandlerAppendEntries(args, reply)
+}
+
 // ticker() 的作用
 // 作为 Follower：超时没收到心跳，要开始竞选（成为 Candidate）
 // 作为 Leader：定期给所有 Follower 发送心跳
@@ -237,6 +245,7 @@ func (raft *Raft) ticker() {
 			log.Printf("timeout: stamp: %v, raft: %v\n", raft.stamp, raft.me)
 			go raft.election()
 		}
+		raft.lock.Unlock()
 		random_timeout = rand.Intn(MaxElectionTime) + MinElectionTime
 		time.Sleep(time.Duration(random_timeout) * time.Millisecond)
 	}
@@ -258,17 +267,18 @@ func (raft *Raft) election() {
 	args := RequestVoteArgs {
 		Term: raft.currentTerm,
 		CandidateID: raft.me,
-		PrevLogTerm: raft.currentTerm,
+		PrevLogTerm: raft.log[len(raft.log) - 1].Term,
 		PrevLogIndex: raft.ToVirtualIndex(len(raft.log) - 1),
 	}
 	raft.lock.Unlock()
 
-	for i, _ := range raft.peers {
+	for i := 0; i < len(raft.peers); i++ {
 		if i == raft.me {
+			log.Printf("skipped vote request server: %v\n", i)
 			continue
 		} 
 		reply := RequestVoteReply{}
-		go raft.collectVote(raft.me, &args, &reply)
+		go raft.collectVote(i, &args, &reply)
 	}
 }
 
@@ -277,6 +287,7 @@ func (raft *Raft) collectVote(server int, args *RequestVoteArgs,
 		reply *RequestVoteReply) {
 	ok := raft.sendRequestVote(server, args, reply)
 	if !ok {
+		log.Fatalf("failed RPC, server: %v\n", server)
 		return 
 	}
 	raft.lock.Lock()
@@ -311,7 +322,7 @@ func (raft *Raft) collectVote(server int, args *RequestVoteArgs,
 		for i := 0; i < len(raft.nextIndex); i++ {
 			raft.nextIndex[i] = raft.ToVirtualIndex(len(raft.log))
 		}
-		go raft.cycleAppendEntry() 
+		go raft.AppendEntry() 
 	}
 	raft.lock.Unlock()
 }
@@ -388,7 +399,7 @@ type AppendEntriesReply struct {
 
 // 周期心跳函数
 // Leader 在后台定时给 Follower 发送心跳或日子同步
-func (raft *Raft) cycleAppendEntry() {
+func (raft *Raft) AppendEntry() {
 	// 记录当前时间，后续每隔 100ms 发送一次心跳
 	raft.nextHeartBeat = time.Now()
 
@@ -435,7 +446,7 @@ func (raft *Raft) cycleAppendEntry() {
 				go raft.SendInstallSnapshot(i)
 			} else {
 				// 正常发送心跳 
-				args.PrevLogTerm = raft.log[raft.ToRealIndex(len(raft.log))].Term
+				args.PrevLogTerm = raft.log[raft.ToRealIndex(args.PrevLogIndex)].Term
 				go raft.SendAppendEntries(i, &args, &reply)
 			}
 		}
@@ -521,19 +532,19 @@ func (raft *Raft) SendAppendEntries(server int, args *AppendEntriesArgs,
 			raft.lock.Unlock()
 			return
 		} 
-		// 
 	}
+
 }
 
 // Follower 处理 Leader 发送的 RPC 逻辑
 // 同时处理日志同步和心跳检测的任务 
-func (raft *Raft) HandlerAppendEntries(server int, args *AppendEntriesArgs, 
+func (raft *Raft) HandlerAppendEntries(args *AppendEntriesArgs, 
 			reply *AppendEntriesReply) {
 	raft.lock.Lock() 
 	
 	// 判断 Leader 的任期是否小于自己的，需要忽略这个旧的请求，防止旧 Leader 干扰集群
 	if args.Term < raft.currentTerm {
-		log.Printf("failed, leader is old, server: %v\n", server)
+		log.Printf("failed, leader is old, leader: %v\n", args.LeaderID)
 		reply.Success = false 
 		reply.Term = raft.currentTerm 
 		raft.lock.Unlock()
@@ -569,7 +580,7 @@ func (raft *Raft) HandlerAppendEntries(server int, args *AppendEntriesArgs,
 		reply.XIndex = i + 1 
 		reply.XLen = raft.ToRealIndex(len(raft.log))
 		isConflict = true 
-		log.Printf("log term unmatched for server: %v in term: %v\n", server, reply.XTerm)
+		log.Printf("log term unmatched for leaderID: %v in term: %v\n", args.LeaderID, reply.XTerm)
 	}
 
 	if isConflict {
