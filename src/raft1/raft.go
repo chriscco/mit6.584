@@ -8,10 +8,11 @@ package raft
 
 import (
 	//	"bytes"
+	//  "go/doc/comment"
 	"log"
+	"math"
 	"math/rand"
 	"sync"
-	"math"
 	"sync/atomic"
 	"time"
 
@@ -443,7 +444,7 @@ func (raft *Raft) cycleAppendEntry() {
 	}
 }
 
-
+// TODO 
 func (raft *Raft) SendInstallSnapshot(index int) {
 
 }
@@ -471,6 +472,56 @@ func (raft *Raft) SendAppendEntries(server int, args *AppendEntriesArgs,
 		raft.persist()
 		raft.lock.Unlock() 
 		return 
+	}
+
+	if reply.Success {
+		raft.matchIndex[server] = args.PrevLogIndex + len(args.Entries)
+		raft.nextIndex[server] = args.PrevLogIndex + len(args.Entries) + 1
+
+		// 推进 commitIndex
+		// 1. 从日志末尾开始找
+		// 2. 判断这条日志是否被超一半的节点（包括自己）复制了
+		// 3. 并且这条日志的任期必须喝当前任期一致
+		// 4. 如果是，则可以安全地更新 commitIndex
+		N := raft.ToVirtualIndex(len(raft.log) - 1) 
+		for N > raft.commitIndex {
+			count := 1 
+			for i := range(len(raft.peers)) {
+				if i == raft.me {
+					continue 
+				}
+				if raft.matchIndex[i] >= N && raft.log[raft.ToRealIndex(N)].Term == raft.currentTerm {
+					count += 1
+				}
+			}
+			if count > len(raft.peers) / 2 {
+				raft.commitIndex = N 
+				log.Printf("commitIndex updated at N: %v\n", N)
+				break
+			}
+			N -= 1
+		}
+		raft.lock.Unlock()
+		return 
+	}
+
+	// 同步失败，需要检查自己是否是 Leader 并且是否是因为任期不同导致的失败 
+	if raft.state == Leader && reply.Term == raft.currentTerm {
+		log.Printf("conflict log term: %v, index: %v\n", reply.XTerm, reply.XIndex)
+
+		// 处理不存在该日志的情况
+		if reply.XTerm == -1 {
+			// 如果 Follower 的日志太旧，并且比快照还旧，需要从快照中给他更新
+			if raft.lastIncludedIndex >= reply.XLen {
+				go raft.SendInstallSnapshot(server)
+			} else {
+				// 否则只需要将下一个索引设置在它的日志末尾
+				raft.nextIndex[server] = reply.XLen
+			}
+			raft.lock.Unlock()
+			return
+		} 
+		// 
 	}
 }
 
@@ -500,7 +551,7 @@ func (raft *Raft) HandlerAppendEntries(server int, args *AppendEntriesArgs,
 
 	isConflict := false 
 	// 如果需要匹配的日志索引 args.PrevLogIndex （即 Follower 的日志太小）或是
-	// 日志索引太小（即已经被快照覆盖了）都会造成日志冲突
+	// 匹配的日志索引太小（即已经被快照覆盖了）都会造成日志冲突
 	if args.PrevLogIndex >= raft.ToVirtualIndex(len(raft.log)) || 
 			args.PrevLogIndex < raft.lastIncludedIndex {
 		reply.XTerm = -1 
